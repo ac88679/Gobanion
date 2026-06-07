@@ -25,6 +25,12 @@ share/python-wheels/
 .installed.cfg
 *.egg
 MANIFEST
+.idea/
+backend/_logs/
+backend/_workspace/
+frontend/.vscode
+frontend/dist
+frontend/node_modules
 
 # PyInstaller
 #   Usually these files are written by a python script from a template
@@ -149,6 +155,7 @@ activemq-data/
 
 # Environments
 .env
+.env.local
 .envrc
 .venv
 env/
