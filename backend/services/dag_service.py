@@ -33,7 +33,12 @@ class DagService:
     def __init__(self, db_url: Optional[str] = None):
         settings = get_settings()
         db_url = db_url or str(settings.database.URL)
-        self._engine = create_engine(db_url, echo=settings.database.ECHO)
+        self._engine = create_engine(
+            db_url,
+            echo=settings.database.ECHO,
+            connect_args={"check_same_thread": False, "timeout": 10},
+            pool_pre_ping=True,
+        )
         self._create_tables()
 
     # ── Database init ──────────────────────────────────────────────
@@ -129,7 +134,7 @@ class DagService:
 
             # Extra fields
             if "self_check" in extra and new_status == "done":
-                node.self_check = json.dumps(extra["self_check"])
+                node.self_check = json.dumps(extra["self_check"], ensure_ascii=False)
             if "outputs" in extra:
                 node.outputs = extra["outputs"]
             if "assigned_agents" in extra:

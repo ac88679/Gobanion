@@ -8,7 +8,9 @@
 环境信息：
 - 操作系统：{os_type}
 - 包管理命令：{pip_cmd}
+- 前端依赖管理：{npm_cmd}
 - 注意事项：没有管理员权限，禁止使用 setx /M、sudo 等需要提权的命令
+{upstream_context}
 
 步骤定义：
 {step_def}
@@ -20,15 +22,13 @@
 
 已重试次数：{retry_count} 次
 
-分析错误原因并选择恢复策略。只输出合法的 JSON，不要 markdown 代码块：
-
-{{"action": "retry"|"fix_and_retry"|"skip"|"abort", "reason": "分析结论", "fix_description": "修复步骤描述", "fix_action": "execute_code"|"write_file", "fix_command": "修复用的 shell 命令", "fix_output_file": "写文件时的文件名", "fix_content": "写文件时的文件内容"}}
+分析错误原因，调用 recover 函数选择恢复策略。
 
 各策略含义：
 - retry：直接重试步骤，不做任何修改。适用于瞬态错误。
-- fix_and_retry：先执行修复步骤，然后重新执行原始步骤。
-  修复步骤有两种类型，通过 fix_action 指定：
-  - fix_action="execute_code"：执行 fix_command 修复环境/代码。必须提供 fix_command。
-  - fix_action="write_file"：将 fix_content 写入 fix_output_file。写入纯文本内容，不要加 markdown 包裹。
+- fix_and_retry：先执行修复步骤，然后重试原始步骤。
+  修复步骤通过 steps 数组指定，每条命令只做一件事，不要用 && 或 ; 串成一条长命令。
+  - fix_action="execute_code"：执行一条 shell 命令安装依赖、清理文件等
+  - fix_action="write_file"：重写文件。多行代码可省略 fix_content，Runner 自动生成
 - skip：跳过此步骤，继续执行后续步骤。适用于非关键步骤。
 - abort：无法恢复，标记节点失败。

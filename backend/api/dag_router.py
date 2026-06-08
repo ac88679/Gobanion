@@ -2,6 +2,7 @@
 DAG API Router — 子 Agent / 外部通过 HTTP 操作 DAG
 """
 
+import json
 from pathlib import Path
 from typing import Optional
 from fastapi import APIRouter, HTTPException
@@ -92,26 +93,7 @@ def get_dag(dag_id: str):
         "goal": dag.goal,
         "status": dag.status,
         "created_at": dag.created_at.isoformat(),
-        "nodes": [
-            {
-                "node_id": n.node_id,
-                "title": getattr(n, "title", ""),
-                "goal": n.goal,
-                "error": getattr(n, "error", None),
-                "assigned_roles": n.assigned_roles,
-                "required_skills": n.required_skills,
-                "dependencies": n.dependencies,
-                "acceptance_criteria": n.acceptance_criteria,
-                "status": n.status,
-                "assigned_agents": n.assigned_agents,
-                "channel_id": n.channel_id,
-                "outputs": n.outputs,
-                "self_check": n.self_check,
-                "created_at": n.created_at.isoformat(),
-                "updated_at": n.updated_at.isoformat(),
-            }
-            for n in nodes
-        ],
+        "nodes": [_node_to_dict(n) for n in nodes],
     }
 
 
@@ -300,6 +282,13 @@ def list_events(dag_id: str, limit: int = 50):
 
 
 def _node_to_dict(node) -> dict:
+    # Parse self_check from JSON string to list for frontend convenience
+    self_check = getattr(node, "self_check", None)
+    if isinstance(self_check, str):
+        try:
+            self_check = json.loads(self_check)
+        except (json.JSONDecodeError, TypeError):
+            pass  # leave as string if parsing fails
     return {
         "node_id": node.node_id,
         "dag_id": node.dag_id,
@@ -314,6 +303,7 @@ def _node_to_dict(node) -> dict:
         "assigned_agents": node.assigned_agents,
         "channel_id": node.channel_id,
         "outputs": node.outputs,
+        "self_check": self_check,
         "created_at": node.created_at.isoformat(),
         "updated_at": node.updated_at.isoformat(),
     }

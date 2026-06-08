@@ -84,6 +84,7 @@ class AgentSettings(BaseSettings):
     DISPATCHER_TIMEOUT: int = Field(default=30, alias="AGENT_DISPATCHER_TIMEOUT")
     HEARTBEAT_INTERVAL: int = Field(default=10, alias="AGENT_HEARTBEAT_INTERVAL")
     MAX_RETRIES: int = Field(default=3, alias="AGENT_MAX_RETRIES")
+    EXECUTE_TIMEOUT: int = Field(default=120, alias="AGENT_EXECUTE_TIMEOUT")
 
 
 class GobanionSettings(BaseSettings):

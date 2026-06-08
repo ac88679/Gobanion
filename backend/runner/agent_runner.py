@@ -62,6 +62,10 @@ class AgentRuntime:
         self.llm_endpoint = os.environ.get("LLM_ENDPOINT", "http://localhost:8000/v1")
         self.llm_model = os.environ.get("LLM_MODEL", "")
         self.llm_api_key = os.environ.get("LLM_API_KEY", "")
+        self._execute_timeout = int(os.environ.get("AGENT_EXECUTE_TIMEOUT", "120"))
+
+        # ── Shared outputs dir (all nodes publish here) ──
+        self._outputs_dir = Path.cwd() / "_outputs"
 
         # ── LLM Client ──
         self.llm_client = LLMClient(public=False)
@@ -78,6 +82,8 @@ class AgentRuntime:
         else:
             self._pip_cmd = ""
             self._pip_run_prefix = ""
+        self._has_npm = shutil.which("npm") is not None
+        self._npm_cmd = "npm" if self._has_npm else "npm (未安装)"
 
         # ── State ──
         self.step = 0
@@ -86,6 +92,18 @@ class AgentRuntime:
         self.workspace.mkdir(parents=True, exist_ok=True)
         self._log_file = Path.cwd() / "_logs" / f"{self.node_id}.log"
         self._log_file.parent.mkdir(parents=True, exist_ok=True)
+
+        # ── Upstream outputs context ──
+        upstream_files = []
+        if self._outputs_dir.is_dir():
+            for f in sorted(self._outputs_dir.rglob("*")):
+                if f.is_file():
+                    rel = f.relative_to(self._outputs_dir)
+                    upstream_files.append(str(rel))
+        self._upstream_context = (
+            "上游节点已发布的产出物在 _outputs/ 目录下（相对于 backend/）:\n"
+            + "\n".join(f"  _outputs/{p}" for p in upstream_files)
+        ) if upstream_files else ""
 
         # ── Heartbeat daemon ──
         self._stop_heartbeat = threading.Event()
@@ -129,7 +147,7 @@ class AgentRuntime:
         import urllib.error as _err
 
         url = f"{self.master_api}{path}"
-        data = _json.dumps(body).encode("utf-8")
+        data = _json.dumps(body, ensure_ascii=False).encode("utf-8")
 
         # Bypass proxy via ProxyHandler(None) + build opener
         handler = _req.ProxyHandler({})
@@ -215,7 +233,7 @@ class AgentRuntime:
         try:
             import json as _json
             import urllib.request as _req
-            data = _json.dumps(body).encode("utf-8")
+            data = _json.dumps(body, ensure_ascii=False).encode("utf-8")
             handler = _req.ProxyHandler({})
             opener = _req.build_opener(handler)
             req = _req.Request(
@@ -259,26 +277,35 @@ class AgentRuntime:
     def _extract_json(text: str) -> Optional[dict]:
         """Try to parse a JSON dict from text, using raw_decode to handle trailing data."""
         import json as _json
-        decoder = _json.JSONDecoder(strict=False)
-        text = text.strip()
-        # Try direct parse first
-        try:
-            obj, idx = decoder.raw_decode(text)
-            if isinstance(obj, dict):
-                return obj
-        except _json.JSONDecodeError:
-            pass
-        # Try extracting from markdown code block
         import re
-        match = re.search(r"```(?:json)?\s*(\{.*?\})\s*```", text, re.DOTALL)
-        if match:
+        decoder = _json.JSONDecoder(strict=False)
+        if not text or not text.strip():
+            return None
+        text = text.strip()
+
+        # ── Helper: attempt to parse a candidate string ──
+        def _try_parse(candidate: str) -> Optional[dict]:
             try:
-                obj, idx = decoder.raw_decode(match.group(1).strip())
+                obj, idx = decoder.raw_decode(candidate)
                 if isinstance(obj, dict):
                     return obj
             except _json.JSONDecodeError:
                 pass
-        # Try finding first balanced {...} block
+            return None
+
+        # 1. Direct parse
+        result = _try_parse(text)
+        if result:
+            return result
+
+        # 2. Extract from markdown code block
+        match = re.search(r"```(?:json)?\s*(\{.*?\})\s*```", text, re.DOTALL)
+        if match:
+            result = _try_parse(match.group(1).strip())
+            if result:
+                return result
+
+        # 3. Find first balanced {...} block
         depth = 0
         start = -1
         for i, ch in enumerate(text):
@@ -289,13 +316,50 @@ class AgentRuntime:
             elif ch == "}":
                 depth -= 1
                 if depth == 0 and start >= 0:
+                    result = _try_parse(text[start:i+1])
+                    if result:
+                        return result
+                    start = -1
+
+        # 4. Repair-and-retry: fix common JSON errors in the balanced block
+        for i, ch in enumerate(text):
+            if ch == "{":
+                start = i
+                break
+        if start >= 0:
+            # Find best-guess ending: last } that's not inside a string
+            end = -1
+            in_str = False
+            escape = False
+            for i, ch in enumerate(text):
+                if escape:
+                    escape = False
+                    continue
+                if ch == '\\':
+                    escape = True
+                elif ch == '"' and not escape:
+                    in_str = not in_str
+                elif ch == '}' and not in_str:
+                    end = i
+            if end > start:
+                candidate = text[start:end+1]
+                # Repair attempts (in order of increasing aggressiveness)
+                repairs = [
+                    lambda s: s,                                                     # raw
+                    lambda s: re.sub(r',\s*([}\]])', r'\1', s),                      # trailing commas
+                    lambda s: re.sub(r'(?<!\\)\\(?![\\"/bfnrtu])', r'\\\\', s),       # unescaped backslash
+                    lambda s: re.sub(r'''(?<=[{:\s,\[])\s*'([^']*?)'\s*(?=[:\s,\}\]])''', r'"\1"', s),  # single-quote → double-quote (keys & values)
+                    lambda s: s.replace("'", '"'),                                    # aggressive: all single → double quotes
+                ]
+                for repair in repairs:
                     try:
-                        obj, idx = decoder.raw_decode(text[start:i+1])
+                        fixed = repair(candidate)
+                        obj, idx = decoder.raw_decode(fixed)
                         if isinstance(obj, dict):
                             return obj
                     except _json.JSONDecodeError:
-                        pass
-                    start = -1
+                        continue
+
         return None
 
     # ── Session context builder ─────────────────────────────────────
@@ -417,23 +481,11 @@ class AgentRuntime:
                 self.log(f"Recovery: retrying step {self.step}")
                 # step_idx unchanged → retry same step
             elif action == "fix_and_retry":
-                if recovery.get("fix_action", "execute_code") == "write_file":
-                    fix_step = {
-                        "action": "write_file",
-                        "description": recovery.get("fix_description", "Fix file"),
-                        "output_file": recovery.get("fix_output_file", "fix.py"),
-                        "content": recovery.get("fix_content", ""),
-                    }
-                else:
-                    fix_step = {
-                        "action": "execute_code",
-                        "description": recovery.get("fix_description", "Fix environment"),
-                        "command": recovery.get("fix_command", ""),
-                        "output_file": "",
-                    }
-                self.log(f"Recovery: inserting fix step ({fix_step['action']}) before step {self.step}")
-                plan.insert(step_idx, fix_step)
-                # step_idx unchanged → fix step runs next, then original step
+                    fix_steps = self._build_fix_steps(recovery)
+                    if fix_steps:
+                        self.log(f"Recovery: inserting {len(fix_steps)} fix step(s) before step {self.step}")
+                        plan[step_idx:step_idx] = fix_steps
+                        # step_idx unchanged → first fix step runs next iteration
             elif action == "skip":
                 self.log(f"Recovery: skipping step {self.step}")
                 step_idx += 1
@@ -447,12 +499,15 @@ class AgentRuntime:
         self.log("Running self-check...")
         try:
             self_check = self._run_self_check()
-            self.write_memory(-1, "self_check", {"status": "ok", "summary": json.dumps(self_check)})
+            self.write_memory(-1, "self_check", {"status": "ok", "summary": json.dumps(self_check, ensure_ascii=False)})
         except Exception as e:
             self.log(f"Self-check failed: {e}")
             self_check = [{"criterion": "run completed", "result": "pass", "evidence": "script finished"}]
 
-        # 5. Done (dag_service._on_transition auto-advances to completed)
+        # 5. Publish outputs to shared _outputs/ directory
+        self._publish_outputs()
+
+        # 6. Done
         self.set_status("done", outputs=self.outputs, self_check=self_check)
         self.log(f"Node {self.node_id} completed")
 
@@ -467,7 +522,9 @@ class AgentRuntime:
                             criteria=criteria, skills=skills,
                             pip_cmd=self._pip_cmd,
                             os_type=self._os_type,
-                            pip_run_prefix=self._pip_run_prefix)
+                            pip_run_prefix=self._pip_run_prefix,
+                            npm_cmd=self._npm_cmd,
+                            upstream_context=self._upstream_context)
 
         # ── Tool definition: plan_steps ──
         tools = [{
@@ -486,8 +543,8 @@ class AgentRuntime:
                                 "properties": {
                                     "action": {
                                         "type": "string",
-                                        "description": "做什么（write_file / execute_code / analyze / test / review）",
-                                        "enum": ["write_file", "execute_code", "analyze", "test", "review"],
+                                        "description": "做什么",
+                                        "enum": ["create_dir", "write_file", "execute_code", "analyze", "test", "review"],
                                     },
                                     "description": {
                                         "type": "string",
@@ -495,11 +552,11 @@ class AgentRuntime:
                                     },
                                     "output_file": {
                                         "type": "string",
-                                        "description": "预期的输出文件名，没有就传空字符串",
+                                        "description": "write_file/create_dir 时指定文件名或目录名；execute_code/test 时传空字符串",
                                     },
                                     "command": {
                                         "type": "string",
-                                        "description": "仅在 action=execute_code 或 action=test 时使用，指定要执行的 shell 命令。其他 action 不要传。",
+                                        "description": "仅在 action=execute_code 或 action=test 时使用，指定要执行的 shell 命令。其他 action 不要填。",
                                     },
                                 },
                                 "required": ["action", "description", "output_file"],
@@ -563,6 +620,8 @@ class AgentRuntime:
         action = step_def.get("action", "").lower()
         description = step_def.get("description", "")
 
+        if action == "create_dir":
+            return self._step_create_dir(step_def)
         if action in ("write_file", "code", "review"):
             return self._step_write_file(step_def)
         elif action in ("execute_code", "test", "run"):
@@ -577,6 +636,26 @@ class AgentRuntime:
         if not name:
             name = f"step_{self.step}.txt"
         return self.workspace / name
+
+    def _step_create_dir(self, step_def: dict) -> dict:
+        """Create directory (and parents) in workspace."""
+        dir_path = self._resolve_output_path(step_def)
+        try:
+            dir_path.mkdir(parents=True, exist_ok=True)
+            self.log(f"Created directory {dir_path}")
+            return {
+                "status": "ok",
+                "summary": f"Created directory {dir_path.name}",
+                "output_file": str(dir_path.relative_to(Path.cwd())),
+            }
+        except Exception as e:
+            return {
+                "status": "fail",
+                "summary": str(e),
+                "exit_code": -1,
+                "stdout": "",
+                "stderr": str(e),
+            }
 
     def _step_write_file(self, step_def: dict) -> dict:
         """Generate file content via LLM and write to workspace."""
@@ -641,21 +720,26 @@ class AgentRuntime:
                         "stderr": f"Blocked: {pattern} needs admin rights",
                     }
 
-            # ── If uv is available, auto-prefix python commands ──
+            # ── Auto-prefix python commands with uv ──
             effective_cmd = cmd
             if self._pip_run_prefix and cmd.startswith("python"):
                 effective_cmd = f"{self._pip_run_prefix} {cmd}"
+
             result = subprocess.run(
-                effective_cmd, shell=True, capture_output=True, text=True, timeout=30, cwd=str(self.workspace)
+                effective_cmd, shell=True, capture_output=True,
+                encoding="utf-8", errors="replace", timeout=self._execute_timeout,
+                cwd=str(self.workspace),
             )
+            stdout = result.stdout or ""
+            stderr = result.stderr or ""
             self.log(f"Executed: {effective_cmd} exit={result.returncode}")
-            output = result.stdout + result.stderr
+            output = stdout + stderr
             return {
                 "status": "ok" if result.returncode == 0 else "fail",
                 "summary": f"exit={result.returncode}, output={output[:2000]}",
                 "exit_code": result.returncode,
-                "stdout": result.stdout[:2000] if result.stdout else "",
-                "stderr": result.stderr[:2000] if result.stderr else "",
+                "stdout": stdout[:2000],
+                "stderr": stderr[:2000],
             }
         except Exception as e:
             return {
@@ -721,7 +805,11 @@ class AgentRuntime:
         }
 
     def _recover_from_error(self, step_def: dict, result: dict, retry_count: int) -> dict:
-        """Analyze step failure and decide recovery strategy via LLM."""
+        """Analyze step failure and decide recovery strategy via tool calling.
+
+        Uses tool calling (function calling) instead of text JSON parsing,
+        which is much more reliable — no escaping issues, no JSON repair needed.
+        """
         prompt = get_prompt("agent_error_recovery.md",
                             role=self.agent_role,
                             goal=self.task_def.get("goal", ""),
@@ -732,30 +820,135 @@ class AgentRuntime:
                             stderr=result.get("stderr", ""),
                             retry_count=str(retry_count),
                             pip_cmd=self._pip_cmd,
-                            os_type=self._os_type)
+                            os_type=self._os_type,
+                            npm_cmd=self._npm_cmd,
+                            upstream_context=self._upstream_context)
 
-        try:
-            raw = self.llm_client.chat_text([{"role": "user", "content": prompt}])
-            decision = self._extract_json(raw)
-            if decision is None:
-                raise ValueError(f"LLM response is not valid JSON: {raw[:200]}")
-            action = decision.get("action", "abort")
-            if action not in ("retry", "fix_and_retry", "skip", "abort"):
-                raise ValueError(f"Invalid action: {action}")
-            # fix_and_retry validation
-            if action == "fix_and_retry":
-                fix_action = decision.get("fix_action", "execute_code")
-                if fix_action not in ("execute_code", "write_file"):
-                    raise ValueError(f"Invalid fix_action: {fix_action}")
-                if fix_action == "execute_code" and not decision.get("fix_command", "").strip():
-                    raise ValueError("fix_and_retry/execute_code without fix_command")
-                if fix_action == "write_file" and not decision.get("fix_content", "").strip():
-                    raise ValueError("fix_and_retry/write_file without fix_content")
-            self.log(f"Recovery: {action} — {decision.get('reason', '')}")
-            return decision
-        except Exception as e:
-            self.log(f"Recovery decision failed: {e}")
-            return {"action": "abort", "reason": f"Recovery LLM call failed: {e}"}
+        # ── Tool definition: recover ──
+        tools = [{
+            "type": "function",
+            "function": {
+                "name": "recover",
+                "description": "分析步骤失败原因并决定恢复策略",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "action": {
+                            "type": "string",
+                            "enum": ["retry", "fix_and_retry", "skip", "abort"],
+                            "description": "恢复策略：retry=直接重试, fix_and_retry=修复后重试, skip=跳过, abort=放弃",
+                        },
+                        "reason": {
+                            "type": "string",
+                            "description": "分析结论——为什么失败，为什么选择这个策略",
+                        },
+                        "steps": {
+                            "type": "array",
+                            "description": "修复步骤列表（仅 fix_and_retry 时需要）。每个步骤是独立的修复操作。",
+                            "items": {
+                                "type": "object",
+                                "properties": {
+                                    "fix_action": {
+                                        "type": "string",
+                                        "enum": ["execute_code", "write_file"],
+                                        "description": "execute_code=执行命令, write_file=写文件",
+                                    },
+                                    "fix_description": {
+                                        "type": "string",
+                                        "description": "这一步做什么",
+                                    },
+                                    "fix_command": {
+                                        "type": "string",
+                                        "description": "fix_action=execute_code 时必须提供。一条简单的 shell 命令，只做一件事。",
+                                    },
+                                    "fix_output_file": {
+                                        "type": "string",
+                                        "description": "仅 fix_action=write_file 时使用。要写入的文件路径。",
+                                    },
+                                    "fix_content": {
+                                        "type": "string",
+                                        "description": "可选，仅 fix_action=write_file 时使用。文件内容。如果是多行代码可以省略，Runner 自动生成。",
+                                    },
+                                },
+                                "required": ["fix_action"],
+                            },
+                        },
+                    },
+                    "required": ["action", "reason"],
+                },
+            },
+        }]
+
+        for attempt in range(2):
+            try:
+                result_list = self.llm_client.chat_with_tools(
+                    [{"role": "user", "content": prompt}],
+                    tools,
+                    tool_choice="required",
+                )
+                decision = result_list[0]["arguments"] if result_list else None
+                if not decision:
+                    raise ValueError("Tool call returned no arguments")
+                action = decision.get("action", "abort")
+                if action not in ("retry", "fix_and_retry", "skip", "abort"):
+                    raise ValueError(f"Invalid action: {action}")
+                self.log(f"Recovery: {action} — {decision.get('reason', '')}")
+                return decision
+            except Exception as e:
+                self.log(f"Recovery decision attempt {attempt + 1} failed: {e}")
+                if attempt == 0:
+                    self.log("Retrying recovery...")
+                else:
+                    return {"action": "abort", "reason": f"Recovery LLM call failed after retry: {e}"}
+
+    def _build_fix_steps(self, recovery: dict) -> list[dict]:
+        """Convert recovery decision into a list of fix step dicts.
+
+        Supports two formats:
+        1. New (preferred): recovery["steps"] = [{...}, ...]
+           Each step has fix_action, fix_command/fix_output_file, optional fix_content
+        2. Legacy: recovery["fix_action"] + recovery["fix_command"]/["fix_content"]
+        """
+        steps_raw = recovery.get("steps")
+        if isinstance(steps_raw, list):
+            out = []
+            for i, s in enumerate(steps_raw):
+                if s.get("fix_action") == "write_file":
+                    out.append({
+                        "action": "write_file",
+                        "description": s.get("fix_description", f"修复步骤 {i+1}"),
+                        "output_file": s.get("fix_output_file", "fix.py"),
+                        "content": s.get("fix_content", ""),
+                    })
+                elif s.get("fix_command", "").strip():
+                    out.append({
+                        "action": "execute_code",
+                        "description": s.get("fix_description", f"修复步骤 {i+1}"),
+                        "command": s.get("fix_command", ""),
+                        "output_file": "",
+                    })
+                else:
+                    self.log(f"Step {i}: execute_code without fix_command, skipping")
+            return out
+
+        # Legacy fallback: single fix_action
+        if recovery.get("fix_action") == "write_file":
+            return [{
+                "action": "write_file",
+                "description": recovery.get("fix_description", "Fix file"),
+                "output_file": recovery.get("fix_output_file", "fix.py"),
+                "content": recovery.get("fix_content", ""),
+            }]
+        elif recovery.get("fix_command", "").strip():
+            return [{
+                "action": "execute_code",
+                "description": recovery.get("fix_description", "Fix environment"),
+                "command": recovery.get("fix_command", ""),
+                "output_file": "",
+            }]
+        else:
+            self.log("execute_code fix step without fix_command, skipping")
+            return []
 
     def _run_self_check(self) -> list[dict]:
         """Check each acceptance criterion."""
@@ -797,6 +990,36 @@ class AgentRuntime:
         """Graceful abort: finish current step, write interrupted memory."""
         self.write_memory(-1, "abort", {"status": "interrupted", "summary": "Received ABORT from master"})
         self.set_status("interrupted", outputs=self.outputs)
+
+    def _publish_outputs(self):
+        """Copy node output files to shared _outputs/ directory.
+
+        Each step's output_file is relative to workspace.
+        Published to _outputs/ preserving that relative path.
+        Downstream nodes see these files via _upstream_context prompt.
+        """
+        if not self.outputs:
+            return
+        published = 0
+        for rel_path in self.outputs:
+            src = Path.cwd() / rel_path
+            if not src.exists() or not src.is_file():
+                continue
+            # Strip workspace prefix if present: _workspace/T-XXX/backend/... → backend/...
+            try:
+                dst_rel = Path(*src.relative_to(self.workspace).parts[1:]) if str(src).startswith(str(self.workspace)) else Path(rel_path)
+            except ValueError:
+                dst_rel = Path(rel_path)
+            dst = self._outputs_dir / dst_rel
+            dst.parent.mkdir(parents=True, exist_ok=True)
+            try:
+                import shutil
+                shutil.copy2(src, dst)
+                published += 1
+            except Exception as e:
+                self.log(f"Publish failed: {rel_path} → {dst}: {e}")
+        if published:
+            self.log(f"Published {published} file(s) to _outputs/")
 
 
 # ── Entry point ────────────────────────────────────────────────────

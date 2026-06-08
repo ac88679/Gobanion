@@ -126,7 +126,7 @@ class Dispatcher:
 
     async def _run_agent(self, dag_id: str, node):
         """Spawn agent_runner.py as subprocess and wait for completion."""
-        runner_path = str(Path(__file__).resolve().parent.parent / "runner" / "agent_runner.py")
+        backend_dir = str(Path(__file__).resolve().parent.parent)
         settings = get_settings()
 
         # Subprocess needs 127.0.0.1, not 0.0.0.0
@@ -153,14 +153,16 @@ class Dispatcher:
             "LLM_ENDPOINT": settings.llm.API_BASE,
             "LLM_MODEL": settings.llm.MODEL,
             "LLM_API_KEY": settings.llm.API_KEY,
+            "AGENT_EXECUTE_TIMEOUT": str(settings.agent.EXECUTE_TIMEOUT),
         })
         if node.channel_id:
             env["CHANNEL_ID"] = node.channel_id
 
         try:
             proc = await asyncio.create_subprocess_exec(
-                sys.executable, runner_path,
+                sys.executable, "-m", "runner.agent_runner",
                 env=env,
+                cwd=backend_dir,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
             )
@@ -188,12 +190,27 @@ class Dispatcher:
 
             if proc.returncode != 0:
                 log.warning("Agent exited with non-zero", node_id=node.node_id, code=proc.returncode)
+                try:
+                    current = self.dag_service.get_node(node.node_id).status
+                    if current == "running":
+                        self.dag_service.transition_node(node.node_id, "failed")
+                except Exception as tx_e:
+                    log.error("Failed to mark node as failed after exit",
+                              node_id=node.node_id, error=str(tx_e))
 
         except asyncio.TimeoutError:
             log.warning("Agent timed out", node_id=node.node_id, timeout=300)
             proc = self._processes.get(node.node_id)
             if proc:
                 proc.kill()
+            try:
+                current = self.dag_service.get_node(node.node_id).status
+                if current == "running":
+                    self.dag_service.transition_node(node.node_id, "failed")
+                # else: heartbeat cycle already handled it (aborting → interrupted)
+            except Exception as tx_e:
+                log.error("Failed to mark timed-out node as failed",
+                          node_id=node.node_id, error=str(tx_e))
         except Exception as e:
             log.error("Agent run failed", node_id=node.node_id, error=str(e))
         finally:
@@ -229,9 +246,12 @@ class Dispatcher:
 
         # 3. Kill subprocess if still alive (running nodes only)
         proc = self._processes.pop(node_id, None)
-        if proc and proc.poll() is None:
-            log.info("Killing agent process", node_id=node_id, pid=proc.pid)
-            proc.kill()
+        if proc:
+            # asyncio.subprocess.Process vs subprocess.Popen
+            is_alive = proc.returncode is None if hasattr(proc, 'returncode') else proc.poll() is None
+            if is_alive:
+                log.info("Killing agent process", node_id=node_id, pid=proc.pid)
+                proc.kill()
 
         # 4. For ready/assigned (no agent process), go straight to interrupted
         if node.status in ("ready", "assigned"):
@@ -298,7 +318,7 @@ class Dispatcher:
                 s.add(dag)
                 s.commit()
 
-        runner_path = str(Path(__file__).resolve().parent.parent / "runner" / "agent_runner.py")
+        backend_dir = str(Path(__file__).resolve().parent.parent)
         settings = get_settings()
 
         for node in nodes:
@@ -340,8 +360,9 @@ class Dispatcher:
             # Spawn subprocess with pipe — forward output to server console in real-time
             try:
                 proc = subprocess.Popen(
-                    [sys.executable, runner_path],
+                    [sys.executable, "-m", "runner.agent_runner"],
                     env=env,
+                    cwd=backend_dir,
                     stdout=subprocess.PIPE,
                     stderr=subprocess.STDOUT,
                 )
