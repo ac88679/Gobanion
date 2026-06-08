@@ -10,10 +10,11 @@
 4. `assigned_roles` 指定谁来做。可选角色：backend, frontend, tester, designer, analyst, devops, generic
 5. `required_skills` 列出子 Agent 需要的技能。可选：code_generator, code_reviewer, git_operator, test_runner, file_io, documenter, api_designer, data_modeler
 6. `dependencies` 是必须前置完成的节点索引列表（0-based）。
-7. `acceptance_criteria` 是逐条的验收标准，子 Agent 会用它来自检。
+7. `acceptance_criteria` 是逐条的验收标准，子 Agent 会用它来自检。格式：每条一行 `- 标准内容`，写在同一个字符串里用 `\n` 分隔。
 8. 节点必须构成有效的 DAG——不能有循环依赖。
-9. 总节点数控制在 2~15 个。
-10. 目标很简单的话，1~2 个节点也行。
+9. 总节点数控制在 2~8 个。节点太少则粒度太粗，太多则调度开销大。
+10. 合理拆分：数据库层、后端 API、前端页面、联调集成各作为一个独立节点。
+11. 不要求每个节点都有输出产物，但每个节点必须能独立验证（通过验收标准）。
 
 ## 输出 JSON 结构
 

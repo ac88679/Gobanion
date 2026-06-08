@@ -192,8 +192,10 @@ class Dispatcher:
                 log.warning("Agent exited with non-zero", node_id=node.node_id, code=proc.returncode)
                 try:
                     current = self.dag_service.get_node(node.node_id).status
-                    if current == "running":
-                        self.dag_service.transition_node(node.node_id, "failed")
+                    # If agent crashed before set_status("running"), still mark as failed
+                    if current in ("running", "assigned"):
+                        self.dag_service.transition_node(node.node_id, "failed",
+                            error=f"Agent exited with code {proc.returncode}")
                 except Exception as tx_e:
                     log.error("Failed to mark node as failed after exit",
                               node_id=node.node_id, error=str(tx_e))

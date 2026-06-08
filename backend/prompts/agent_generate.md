@@ -1,11 +1,11 @@
-你是 {role}，正在做：{goal}
+你是 {{ role }}，正在做：{{ goal }}
 
 已完成步骤：
-{history}
+{{ history }}
 
-当前步骤：{description}
+当前步骤：{{ description }}
 
-为这一步生成输出。写到文件。
+为这一步生成输出。写到文件。内容要完整、有实际价值。
 
 只输出 JSON：
-{{"content": "输出的内容在这里"}}
+{"content": "输出的内容在这里"}

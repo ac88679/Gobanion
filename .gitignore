@@ -28,6 +28,7 @@ MANIFEST
 .idea/
 backend/_logs/
 backend/_workspace/
+backend/_outputs/
 backend/gobanion_dev.db
 frontend/.vscode
 frontend/dist

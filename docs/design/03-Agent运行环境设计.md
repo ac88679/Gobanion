@@ -1,7 +1,7 @@
 # 03 - Agent 运行环境设计
 
 > 每个子 Agent 的文件系统、运行环境、资源分配方案
-> 版本: v0.4 | 日期: 2026-06-07
+> 版本: v0.5 | 日期: 2026-06-08
 
 ---
 
@@ -23,45 +23,56 @@
 ## 二、核心流程：子 Agent 如何执行被指派的 DAG 节点
 
 ```
-Dispatcher 从预热池获取空闲容器（或创建新容器）
+AgentRuntime 在 subprocess 中启动
 
-  ├─ 注入环境变量:
-  │   ├─ NODE_ID=T-003
-  │   ├─ DAG_ID=project-xxx
-  │   ├─ ASSIGNED_ROLES=["backend","frontend"]
-  │   ├─ REQUIRED_SKILLS=code_generator,git_operator,test_runner
-  │   ├─ TASK_DEFINITION_JSON=... (节点完整定义)
-  │   ├─ CHANNEL_ID=chan-T-003  (如有多 Agent 协作)
+  ├─ 环境变量注入（由 Dispatcher 在 subprocess 启动时传入）:
+  │   ├─ NODE_ID=T-0E1321
+  │   ├─ DAG_ID=a8204202-xxx
+  │   ├─ ASSIGNED_ROLES=["backend"]
+  │   ├─ REQUIRED_SKILLS=code_generator,test_runner
+  │   ├─ TASK_DEFINITION_JSON=... (节点完整定义，含 goal / acceptance_criteria)
   │   ├─ AGENT_ROLE=backend      (当前子 Agent 的角色)
-  │   ├─ MASTER_API=http://localhost:xxxx (主 Agent HTTP API)
-  │   └─ LLM_ENDPOINT=http://ollama:11434
+  │   ├─ MASTER_API=http://localhost:5000 (主 Agent HTTP API)
+  │   ├─ LLM_ENDPOINT=http://localhost:8000/v1
+  │   ├─ LLM_MODEL=Qwen3.5-9B
+  │   └── LLM_API_KEY=... (如需要)
   │
-  ├─ 容器启动 agent_runner.py 进入执行模式
+  ├─ AgentRuntime.__init__()
+  │   ├─ 解析所有环境变量
+  │   ├─ 检测运行环境（OS 类型、uv/pip/npm）
+  │   ├─ 构建 self._ctx 上下文字典（注入 prompt 模板）
+  │   ├─ 创建工作区 _workspace/{dag_id}/{node_id}/
+  │   ├─ 复制上游产出物到工作区
+  │   ├─ 初始化日志文件 _logs/{dag_id}/{node_id}.log
+  │   └── 启动心跳 daemon 线程（每 10s POST /heartbeat）
+  │
+  ├─ run() 主流程
+  │   ├─ set_status("running") — 通过 HTTP API
+  │   ├─ _plan_steps() — LLM tool calling 一次性规划全部步骤
+  │   │   └─ 失败时降级：文本 LLM → fallback 解析
+  │   ├─ 逐步骤执行（Loop Agent while 循环）:
+  │   │   ├─ 每步前 check_abort() → 收到 ABORT 则优雅终止
+  │   │   ├─ 每步：_execute_step(step_def)
+  │   │   │   ├─ action=create_dir → _step_create_dir
+  │   │   │   ├─ action=write_file  → _step_write_file (LLM 生成内容)
+  │   │   │   ├─ action=execute_code → _step_execute (subprocess.run)
+  │   │   │   │   └─ 无 command 时 _infer_command() LLM 推断
+  │   │   │   └─ action=analyze/review → _step_llm_generate
+  │   │   ├─ 异常 → 转 fail dict 统一处理
+  │   │   ├─ ok → 收集输出文件路径，step_idx++
+  │   │   ├─ fail → write_memory → Recovery 闭环:
+  │   │   │   ├─ _is_fix 修复步失败 → 直接 abort
+  │   │   │   ├─ retry → step_idx 不变，重试
+  │   │   │   ├─ fix_and_retry → plan 中插入修复步
+  │   │   │   ├─ skip → step_idx++
+  │   │   │   └─ abort → set_status("failed")
+  │   │   └─ 全局上限：最多 20 步，每步最多重试 3 次
+  │   ├─ _run_self_check() — 按验收标准逐条自检
+  │   ├─ _publish_outputs() — 复制到 _outputs/{dag_id}/
+  │   └─ set_status("done") — MVP 跳过 reviewing，直接终态
   │
   ▼
-执行模式
-  │
-  ├─ 从环境变量解析 NODE_ID、ROLE、SKILLS
-  ├─ 从 TASK_DEFINITION_JSON 读取节点定义
-  ├─ 标记 DAG 节点状态为 running
-  ├─ 加载 Skill 组合
-  ├─ 加载角色 Prompt（根据 ASSIGNED_ROLE + 节点 goal）
-  │
-  ├─ (可选) 加入频道 → 与其他协作子 Agent 对齐
-  │   └─ 使用结构化消息协议：proposal/response/issue/synced
-  │
-  ├─ 一次性规划全部执行步骤 → 逐步骤执行：
-  │   ├─ 每步：执行 Skill → 写 L1（通过 HTTP API）
-  │   ├─ 每步前检查 ABORT 信号
-  │   └─ LLM 失败时按三级回退策略处理
-  │
-  ├─ 全部步骤执行完 → 按验收标准逐条自检（生成自检报告）
-  ├─ 节点完成 → 产出物写入 _outputs/
-  ├─ 标记 DAG 节点状态为 done（附带自检报告，通过 HTTP API）
-  ├─ 广播节点间信号（下游节点检查依赖）
-  │
-  ▼
-退出 / 回预热池（等待下一次指派）
+退出（subprocess 终止）
 ```
 
 子 Agent **没有待命模式**。每次启动都有明确的 `NODE_ID` 指派。完成后退出/回池，不监听后续任务。
@@ -73,45 +84,43 @@ Dispatcher 从预热池获取空闲容器（或创建新容器）
 | 方案 | 隔离级别 | 启动速度 | 资源效率 | 复杂度 | 推荐场景 |
 |------|---------|---------|---------|--------|---------|
 | Docker 容器 | OS 级 | ~1-3s | 低 | 高 | **生产 (首选)** |
-| Python subprocess | 进程级 | <10ms | 高 | 低 | MVP / 本地开发 |
+| Python subprocess | 进程级 | <10ms | 高 | 低 | **MVP / 本地开发（当前方案）** |
 | Nix flake | 依赖级 | ~1-3s | 中 | 高 | Unix-Like 专有 |
-
 ---
 
-## 四、推荐方案：Docker + 预热池 + Dispatcher
+## 四、MVP 实现：subprocess + Dispatcher
 
-### 4.1 Dispatcher 调度流程（事件驱动，异步）
+### 4.1 Dispatcher 调度流程（事件驱动，异步，subprocess）
 
 ```
-主 Agent 规划出执行层节点 T-003，assigned_roles: ["backend"]
+主 Agent 规划出执行层节点，assigned_roles: ["backend"]
   │
   ▼
 节点依赖满足 → 状态变 ready
   │
   ▼
-Dispatcher（事件驱动）：
+Dispatcher（事件驱动，独立线程）：
   │
-  ├─ 1. 监听节点状态变更，检测到 ready 节点
+  ├─ 1. 轮询检测 ready 节点（每 2s）
   │
   ├─ 2. 读取节点需求：roles=["backend"], skills=[...]
   │
-  ├─ 3. 从预热池查找：
-  │     ├─ 精确匹配 "backend" 角色的空闲容器 → 命中
-  │     ├─ 未命中 → 查找 "generic" 兜底
-  │     └─ 仍未命中 → 创建新容器（带角色标签）
+  ├─ 3. MVP 直接创建 subprocess（无预热池）
+  │     └─ subprocess.Popen([sys.executable, "agent_runner.py"], env={...})
   │
-  ├─ 4. 注入环境变量（见上面启动流程）
+  ├─ 4. 注入环境变量（node_id, dag_id, task_def, roles 等）
   │
-  ├─ 5. 设置 DAG 节点状态：pending → ready → assigned
+  ├─ 5. 设置 DAG 节点状态：assigned
   │
-  ├─ 6. 异步启动 agent_runner.py（不等待就绪）
+  ├─ 6. 启动 assigned 超时检测（30s 未变 running → failed）
+  │     └─ 修复：同时检查 assigned 和 running 状态
   │
-  └─ 7. 立刻返回，继续处理下一个事件
+  └─ 7. 继续处理下一个事件
 ```
 
-Dispatcher 是主 Agent 进程内的一个组件，负责将"角色需求"映射到"实际运行实例"。所有通信通过 localhost HTTP API 完成。
+Dispatcher 是主 Agent 进程内的一个组件，运行在独立线程中，所有通信通过 localhost HTTP API 完成。
 
-### 4.2 预热池
+### 4.2 预热池（Phase 2 规划）
 
 ```python
 class ContainerPool:
@@ -129,9 +138,8 @@ class ContainerPool:
         """创建带角色标签的新容器"""
 ```
 
-容器带角色标签（创建时通过 `AGENT_ROLE` 环境变量固定），Dispatcher 按角色匹配。
 
-### 4.3 Docker 镜像
+### 4.3 Docker 镜像（Phase 2 规划）
 
 ```dockerfile
 FROM python:3.11-slim
@@ -152,50 +160,70 @@ VOLUME /skills:ro
 CMD ["python", "agent_runner.py"]
 ```
 
+
 ### 4.4 agent_runner.py 核心逻辑
 
+实际实现在 `backend/runner/agent_runner.py`（约 1100 行），核心类 `AgentRuntime`。
+
+**关键设计差异（vs 设计文档伪代码）：**
+
+| 方面 | 设计文档 | 实际实现 |
+|------|---------|---------|
+| Prompt 渲染 | 字符串拼接 | Jinja2 模板引擎 + 独立 `.md` 文件 |
+| 规划方式 | 文本 LLM | Tool calling (function calling)，fallback 文本 |
+| 恢复决策 | 文本 JSON | Tool calling，更可靠的函数式 API |
+| 执行环境 | httpx 客户端 | urllib（绕过代理干扰） |
+| L1 写入 | HTTP API | 本地 JSONL 文件 |
+| 心跳 | — | daemon 线程，每 10s POST |
+| 工作区 | /workspace | _workspace/{dag_id}/{node_id}/ |
+| 复原保护 | 3 次重试 | 3 层：retry_counts + _fix_attempts + _is_fix abort |
+| 命令推断 | — | LLM 推断 shell 命令 (_infer_command) |
+| 产出物发布 | — | _outputs/{dag_id}/ 目录，下游可读 |
+| 密码安全 | — | urllib + ProxyHandler({}) 绕过系统代理 |
+
+**核心执行循环（简化）：**
+
 ```python
-import json, os, httpx
-from pathlib import Path
+while step_idx < len(plan):
+    if self.check_abort():
+        return  # 优雅终止
+    if total_steps >= MAX_TOTAL_STEPS:  # 20
+        set_status("failed")
 
-MASTER_API = os.environ["MASTER_API"]
+    step = plan[step_idx]
+    try:
+        result = self._execute_step(step)
+    except Exception as e:
+        result = {"status": "fail", "exit_code": -1, "stderr": str(e)}
 
-class AgentRuntime:
-    def __init__(self):
-        self.workspace = Path("/workspace") if os.name != "nt" else Path(os.getcwd())
-        self.node_id = os.environ["NODE_ID"]
-        self.dag_id = os.environ["DAG_ID"]
-        self.assigned_roles = json.loads(os.environ["ASSIGNED_ROLES"])
-        self.my_role = os.environ["AGENT_ROLE"]
-        self.required_skills = os.environ["REQUIRED_SKILLS"].split(",")
-        self.task_def = json.loads(os.environ["TASK_DEFINITION_JSON"])
-        self.channel_id = os.environ.get("CHANNEL_ID")
+    if result["status"] == "ok":
+        step_idx += 1
+        continue
 
-        # 加载 Skill
-        self.skills = self.load_skills(self.required_skills)
-        # 连接频道（如需）
-        self.channel = self.connect_channel(self.channel_id) if self.channel_id else None
+    # Fix step failure → immediate abort
+    if step.get("_is_fix"):
+        set_status("failed")
+        return
 
-        # HTTP API 客户端
-        self.api = httpx.Client(base_url=MASTER_API)
+    # Recovery
+    retry_counts[step_idx] += 1
+    if retry_counts[step_idx] > 3:
+        set_status("failed")
+        return
 
-    # ─── HTTP API 封装 ──────────────────────────
-    def set_status(self, status: str, **extra):
-        self.api.post("/api/v1/node/status", json={
-            "node_id": self.node_id, "status": status, **extra
-        })
+    recovery = self._recover_from_error(step, result, retry_counts[step_idx])
+    action = recovery.get("action", "abort")
 
-    def write_memory(self, step, action, result):
-        self.api.post("/api/v1/memory/write", json={
-            "node_id": self.node_id, "step": step,
-            "action": action, "result": result
-        })
-
-    def check_abort(self) -> bool:
-        r = self.api.get(f"/api/v1/node/check-abort?node_id={self.node_id}")
-        return r.json().get("aborted", False)
-
-    def check_stuck_arbitration(self) -> dict | None:
+    if action == "retry":
+        pass  # step_idx unchanged
+    elif action == "fix_and_retry":
+        plan[step_idx:step_idx] = build_fix_steps(recovery)
+    elif action == "skip":
+        step_idx += 1
+    else:  # abort
+        set_status("failed", error=reason)
+        return
+```
         """查是否有仲裁结果"""
         r = self.api.get(f"/api/v1/channel/arbitration?channel_id={self.channel_id}")
         return r.json() if r.status_code == 200 else None
@@ -330,51 +358,6 @@ class AgentRuntime:
 
 ---
 
-## 四-X. 新增特性（v0.4）
-
-### 环境检测
-
-子 Agent 启动时自动检测运行环境，注入到 LLM 上下文：
-
-```
-self._os_type = "Windows" / "Linux/Mac"
-self._pip_cmd = "uv pip install" / "pip install" / ""
-self._pip_run_prefix = "uv run" / ""
-```
-
-检测结果影响三处：
-- planner prompt：告知 LLM 操作系统类型和包管理工具
-- 执行层：自动给 `python` 开头的命令加 `uv run` 前缀
-- recovery prompt：告知 LLM 可用的包管理命令
-
-### 执行安全
-
-**命令黑名单**：拦截需要管理员权限的命令（`setx /M`、`sudo`、`choco install`）
-
-**Markdown 剥离**：写入文件前自动去掉 LLM 输出的 ```python ... ``` 包裹
-
-### 日志实时流
-
-子 Agent 的每条日志通过 `print(flush=True)` 实时输出到 stdout，Dispatcher 通过 `subprocess.PIPE` + 后台 reader 线程逐行转发到服务器控制台。
-
-日志 API：`GET /api/v1/dag/{dag_id}/nodes/{node_id}/logs?tail=N&offset=N`
-
-支持 tail（取最后 N 行）和 offset（增量读取）两种轮询方式。
-
-### Session 上下文组装
-
-每步 LLM 调用前读取 `_memory.jsonl`，构建累积步骤历史传入 `{history}` 变量：
-
-```
-已完成步骤：
-  步骤 1: write_file → ok  - Wrote routes.py (5107 bytes)
-  步骤 2: execute_code → ok  - exit=0, output=...
-```
-
-各 prompt 模板均增加 `{history}` 占位符，让 LLM 知道前面已经做了什么。
-
----
-
 ## 五、子 Agent LLM 调用方式
 
 ```
@@ -382,7 +365,7 @@ self._pip_run_prefix = "uv run" / ""
 │  GPU 主机 (共享)                              │
 │                                              │
 │  Ollama / vLLM / llama.cpp 运行               │
-│  (加载 Qwen2.5-Coder-7B 等小模型)             │
+│  (加载 Qwen3.5-9B 等小模型)             │
 │                                              │
 │  API: /v1/chat/completions                   │
 │  API: /v1/embeddings                         │
@@ -437,6 +420,10 @@ self._pip_run_prefix = "uv run" / ""
 ├── 无响应检测: 10s 无心跳 → 标记 interrupted
 ├── 命令黑名单: setx /M、sudo、choco install 等提权命令
 ├── uv run 隔离: 通过 uv run 运行 Python 命令，不污染系统环境
+├── LLM 输出过滤: markdown 代码块包裹 (```...) 写入文件前自动剥离
+├── 端口安全: 禁止启动 HTTP 服务（主后端已占用 5000 端口）
+├── 禁止后台进程: 不允许 &、nohup 等方式
+├── API 测试要求: 使用框架测试客户端 (test_client)，不启动真实服务器
 ├── 通信设施有独立的安全通道
 └── uvicorn 热重载排除: _workspace/***、_logs/***、.venv/***
 ```

@@ -37,11 +37,20 @@ MAX_TOTAL_STEPS = 20     # 全局最大执行步数（含修复步骤）
 # 从 services 加载 prompt（agent_runner.py 作为 subprocess 运行时路径可能不同）
 # 直接算相对路径，不依赖 import
 _PROMPT_DIR = Path(__file__).resolve().parent.parent / "prompts"
-def get_prompt(name: str, **kwargs: str) -> str:
+
+_jinja_env = None
+
+def _get_jinja_env():
+    global _jinja_env
+    if _jinja_env is None:
+        from jinja2 import Environment, StrictUndefined
+        _jinja_env = Environment(undefined=StrictUndefined, autoescape=False)
+    return _jinja_env
+
+def get_prompt(name: str, **kwargs) -> str:
     content = (_PROMPT_DIR / name).read_text(encoding="utf-8")
-    if kwargs:
-        content = content.format(**kwargs)
-    return content
+    tpl = _get_jinja_env().from_string(content)
+    return tpl.render(**kwargs)
 
 
 class AgentRuntime:
@@ -71,39 +80,79 @@ class AgentRuntime:
         self.llm_client = LLMClient(public=False)
 
         # ── Environment detection ──
-        import shutil
+        import shutil, subprocess
         self._os_type = "Windows" if os.name == "nt" else "Linux/Mac"
-        if shutil.which("uv"):
+
+        def _get_version(cmd: str) -> str:
+            try:
+                r = subprocess.run([cmd, "--version"], capture_output=True, text=True, timeout=5)
+                return r.stdout.strip() or r.stderr.strip() or cmd
+            except Exception:
+                return cmd
+
+        # Python
+        self._py_version = _get_version("python")
+        has_uv = shutil.which("uv") is not None
+        if has_uv:
             self._pip_cmd = "uv pip install"
             self._pip_run_prefix = "uv run"
+            self._pip_note = f"安装到项目 .venv，用 {self._pip_run_prefix} 执行时自动可见"
+            self._uv_version = _get_version("uv")
         elif shutil.which("pip"):
             self._pip_cmd = "pip install"
             self._pip_run_prefix = ""
+            self._pip_note = "安装到系统 Python site-packages"
         else:
             self._pip_cmd = ""
             self._pip_run_prefix = ""
+            self._pip_note = "未检测到包管理工具"
+
+        # Node / npm
+        self._has_node = shutil.which("node") is not None
+        self._node_version = _get_version("node") if self._has_node else ""
         self._has_npm = shutil.which("npm") is not None
-        self._npm_cmd = "npm" if self._has_npm else "npm (未安装)"
+        self._npm_version = _get_version("npm") if self._has_npm else ""
+
+        # ── Workspace ──
+        self.workspace = Path.cwd() / "_workspace" / self.dag_id / self.node_id
+        self.workspace.mkdir(parents=True, exist_ok=True)
+        self._log_file = Path.cwd() / "_logs" / self.dag_id / f"{self.node_id}.log"
+        self._log_file.parent.mkdir(parents=True, exist_ok=True)
+
+        # ── Upstream outputs: copy into workspace for direct access ──
+        upstream_files = []
+        dag_upstream = self._outputs_dir / self.dag_id
+        if dag_upstream.is_dir():
+            import shutil as _su
+            for f in sorted(dag_upstream.rglob("*")):
+                if f.is_file():
+                    rel = f.relative_to(dag_upstream)
+                    upstream_files.append(str(rel))
+                    _su.copy2(f, self.workspace / rel.name)
+        if not upstream_files:
+            # Fallback: check root _outputs/ (old format, pre-dag_id)
+            for f in sorted(self._outputs_dir.rglob("*")):
+                if f.is_file() and f.parent == self._outputs_dir:
+                    upstream_files.append(f.name)
+                    _su.copy2(f, self.workspace / f.name)
+        self._ctx = {
+            "node_id": self.node_id,
+            "dag_id": self.dag_id,
+            "py_version": self._py_version,
+            "pip_cmd": self._pip_cmd,
+            "pip_run_prefix": self._pip_run_prefix or "",
+            "has_uv": has_uv,
+            "uv_version": self._uv_version if has_uv else "",
+            "has_node": self._has_node,
+            "node_version": self._node_version if self._has_node else "",
+            "npm_version": self._npm_version if self._has_npm else "",
+            "os_type": self._os_type,
+            "upstream_files": upstream_files,
+        }
 
         # ── State ──
         self.step = 0
         self.outputs: list[str] = []
-        self.workspace = Path.cwd() / "_workspace" / self.node_id
-        self.workspace.mkdir(parents=True, exist_ok=True)
-        self._log_file = Path.cwd() / "_logs" / f"{self.node_id}.log"
-        self._log_file.parent.mkdir(parents=True, exist_ok=True)
-
-        # ── Upstream outputs context ──
-        upstream_files = []
-        if self._outputs_dir.is_dir():
-            for f in sorted(self._outputs_dir.rglob("*")):
-                if f.is_file():
-                    rel = f.relative_to(self._outputs_dir)
-                    upstream_files.append(str(rel))
-        self._upstream_context = (
-            "上游节点已发布的产出物在 _outputs/ 目录下（相对于 backend/）:\n"
-            + "\n".join(f"  _outputs/{p}" for p in upstream_files)
-        ) if upstream_files else ""
 
         # ── Heartbeat daemon ──
         self._stop_heartbeat = threading.Event()
@@ -466,10 +515,25 @@ class AgentRuntime:
                 step_idx += 1
                 continue
 
+            # ── Fix step failure → abort immediately (no recovery for fixes) ──
+            if step_def.get("_is_fix"):
+                err = f"Fix step {self.step} failed, aborting: {result.get('summary', '')}"
+                self.log(err)
+                self.set_status("failed", outputs=self.outputs, error=err)
+                return
+
             # ── Step failed — attempt recovery ──
             retry_counts[step_idx] = retry_counts.get(step_idx, 0) + 1
             if retry_counts[step_idx] > MAX_RETRIES:
                 err = f"Step {self.step} failed after {MAX_RETRIES} retries: {result.get('summary', '')}"
+                self.log(err)
+                self.set_status("failed", outputs=self.outputs, error=err)
+                return
+
+            # Limit fix-and-retry cycles for the same step
+            fix_attempts = step_def.get("_fix_attempts", 0)
+            if fix_attempts >= MAX_RETRIES:
+                err = f"Step {self.step} failed after {MAX_RETRIES} fix cycles: {result.get('summary', '')}"
                 self.log(err)
                 self.set_status("failed", outputs=self.outputs, error=err)
                 return
@@ -481,6 +545,7 @@ class AgentRuntime:
                 self.log(f"Recovery: retrying step {self.step}")
                 # step_idx unchanged → retry same step
             elif action == "fix_and_retry":
+                    step_def["_fix_attempts"] = fix_attempts + 1
                     fix_steps = self._build_fix_steps(recovery)
                     if fix_steps:
                         self.log(f"Recovery: inserting {len(fix_steps)} fix step(s) before step {self.step}")
@@ -520,11 +585,7 @@ class AgentRuntime:
         prompt = get_prompt("agent_step_planner.md",
                             role=self.agent_role, goal=goal,
                             criteria=criteria, skills=skills,
-                            pip_cmd=self._pip_cmd,
-                            os_type=self._os_type,
-                            pip_run_prefix=self._pip_run_prefix,
-                            npm_cmd=self._npm_cmd,
-                            upstream_context=self._upstream_context)
+                            **self._ctx)
 
         # ── Tool definition: plan_steps ──
         tools = [{
@@ -819,10 +880,7 @@ class AgentRuntime:
                             stdout=result.get("stdout", ""),
                             stderr=result.get("stderr", ""),
                             retry_count=str(retry_count),
-                            pip_cmd=self._pip_cmd,
-                            os_type=self._os_type,
-                            npm_cmd=self._npm_cmd,
-                            upstream_context=self._upstream_context)
+                            **self._ctx)
 
         # ── Tool definition: recover ──
         tools = [{
@@ -919,6 +977,7 @@ class AgentRuntime:
                         "description": s.get("fix_description", f"修复步骤 {i+1}"),
                         "output_file": s.get("fix_output_file", "fix.py"),
                         "content": s.get("fix_content", ""),
+                        "_is_fix": True,
                     })
                 elif s.get("fix_command", "").strip():
                     out.append({
@@ -926,6 +985,7 @@ class AgentRuntime:
                         "description": s.get("fix_description", f"修复步骤 {i+1}"),
                         "command": s.get("fix_command", ""),
                         "output_file": "",
+                        "_is_fix": True,
                     })
                 else:
                     self.log(f"Step {i}: execute_code without fix_command, skipping")
@@ -938,6 +998,7 @@ class AgentRuntime:
                 "description": recovery.get("fix_description", "Fix file"),
                 "output_file": recovery.get("fix_output_file", "fix.py"),
                 "content": recovery.get("fix_content", ""),
+                "_is_fix": True,
             }]
         elif recovery.get("fix_command", "").strip():
             return [{
@@ -945,6 +1006,7 @@ class AgentRuntime:
                 "description": recovery.get("fix_description", "Fix environment"),
                 "command": recovery.get("fix_command", ""),
                 "output_file": "",
+                "_is_fix": True,
             }]
         else:
             self.log("execute_code fix step without fix_command, skipping")
@@ -992,26 +1054,22 @@ class AgentRuntime:
         self.set_status("interrupted", outputs=self.outputs)
 
     def _publish_outputs(self):
-        """Copy node output files to shared _outputs/ directory.
+        """Copy node output files to shared _outputs/{dag_id}/ directory.
 
         Each step's output_file is relative to workspace.
-        Published to _outputs/ preserving that relative path.
+        Published to _outputs/{dag_id}/ preserving filename.
         Downstream nodes see these files via _upstream_context prompt.
         """
         if not self.outputs:
             return
         published = 0
+        dag_out = self._outputs_dir / self.dag_id
+        dag_out.mkdir(parents=True, exist_ok=True)
         for rel_path in self.outputs:
             src = Path.cwd() / rel_path
             if not src.exists() or not src.is_file():
                 continue
-            # Strip workspace prefix if present: _workspace/T-XXX/backend/... → backend/...
-            try:
-                dst_rel = Path(*src.relative_to(self.workspace).parts[1:]) if str(src).startswith(str(self.workspace)) else Path(rel_path)
-            except ValueError:
-                dst_rel = Path(rel_path)
-            dst = self._outputs_dir / dst_rel
-            dst.parent.mkdir(parents=True, exist_ok=True)
+            dst = dag_out / src.name
             try:
                 import shutil
                 shutil.copy2(src, dst)
@@ -1019,7 +1077,7 @@ class AgentRuntime:
             except Exception as e:
                 self.log(f"Publish failed: {rel_path} → {dst}: {e}")
         if published:
-            self.log(f"Published {published} file(s) to _outputs/")
+            self.log(f"Published {published} file(s) to {self._outputs_dir.name}/{self.dag_id}/")
 
 
 # ── Entry point ────────────────────────────────────────────────────

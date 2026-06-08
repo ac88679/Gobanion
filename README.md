@@ -136,7 +136,7 @@ uv run python main.py
 
 | 文档 | 版本 | 内容 |
 |------|------|------|
-| [系统架构](docs/design/01-系统架构.md) | v0.5 | DAG 节点、指派机制、通信设施 |
-| [记忆系统](docs/design/02-记忆系统设计.md) | v0.3 | 四层记忆 |
-| [运行环境](docs/design/03-Agent运行环境设计.md) | v0.4 | agent_runner、Loop Agent、安全 |
-| [待办清单](docs/design/04-待办清单.md) | v0.5 | 全部决策记录和实施计划 |
+| [系统架构](docs/design/01-系统架构.md) | v0.6 | DAG 节点、指派机制、通信设施、MVP 状态 |
+| [记忆系统](docs/design/02-记忆系统设计.md) | v0.4 | 四层记忆、MVP JSONL 实现说明 |
+| [运行环境](docs/design/03-Agent运行环境设计.md) | v0.5 | agent_runner、Loop Agent、安全、subprocess |
+| [待办清单](docs/design/04-待办清单.md) | v0.6 | 全部决策记录和实施计划 |
