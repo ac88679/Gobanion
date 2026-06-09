@@ -229,7 +229,7 @@ class AgentRuntime:
             self.log(f"set_status({status}) failed: {e}")
             raise
 
-    def write_memory(self, step: int, action: str, result: dict):
+    def write_memory(self, step: int, action: str, result: dict, description: str = ""):
         """Write L1 step memory (future: will POST to /api/v1/memory)."""
         # MVP: log to file; Phase 2 will add actual L1 API endpoint
         entry = {
@@ -239,6 +239,7 @@ class AgentRuntime:
             "actor": self.agent_role,
             "status": result.get("status", "unknown"),
             "summary": result.get("summary", ""),
+            "description": description,
             "timestamp": datetime.now(timezone.utc).isoformat(),
         }
         memory_file = self.workspace / "_memory.jsonl"
@@ -411,14 +412,33 @@ class AgentRuntime:
 
         return None
 
+    @staticmethod
+    def _summarize_code_snippet(content: str) -> str:
+        """Extract key structure from code for context summaries."""
+        import re
+        lines = content.splitlines()
+        parts = []
+
+        imports = [l for l in lines if l.startswith("import ") or l.startswith("from ")]
+        if imports:
+            ext = [i for i in imports if not i.startswith(("import os", "import sys", "import re", "import json", "from typing"))]
+            parts.append(f"imports: {len(ext)}" if ext else "imports: stdlib")
+
+        for l in lines:
+            s = l.strip()
+            if s.startswith("def "):
+                parts.append(f"fn:{s[4:].split('(')[0].strip()}")
+            elif s.startswith("class "):
+                parts.append(f"class:{s[6:].split('(')[0].split(':')[0].strip()}")
+            elif "@" in s and "route" in s.lower():
+                parts.append(f"route:{s.strip()}")
+
+        return "; ".join(parts[:6]) if parts else f"{len(content)} chars"
+
     # ── Session context builder ─────────────────────────────────────
 
     def _build_step_history(self) -> str:
-        """Read _memory.jsonl and format as readable step history.
-        Returns a string like:
-          步骤 1: write_file → ok  - Wrote routes.py (5107 bytes)
-          步骤 2: execute_code → ok  - exit=0
-        """
+        """Read _memory.jsonl and format as readable step history."""
         memory_file = self.workspace / "_memory.jsonl"
         if not memory_file.exists():
             return "(无)"
@@ -435,14 +455,15 @@ class AgentRuntime:
                     action = entry.get("action", "?")
                     status = entry.get("status", "?")
                     summary = entry.get("summary", "")
+                    description = entry.get("description", "")
 
-                    # Skip internal entries
                     if action in ("start", "plan", "plan_failed", "self_check", "abort", "interrupted"):
                         continue
                     if step is None or (isinstance(step, int) and step <= 0):
                         continue
 
-                    lines.append(f"  步骤 {step}: {action} → {status}  - {summary}")
+                    base = f"  步骤 {step}: [{action}] {description}" if description else f"  步骤 {step}: [{action}]"
+                    lines.append(f"{base}  → {status}  {summary}")
         except Exception:
             return "(读取历史失败)"
 
@@ -506,7 +527,8 @@ class AgentRuntime:
                     "stderr": str(e),
                 }
 
-            self.write_memory(self.step, step_def.get("action", "execute"), result)
+            self.write_memory(self.step, step_def.get("action", "execute"), result,
+                              description=step_def.get("description", ""))
 
             if result.get("status") == "ok":
                 # Collect outputs
@@ -743,7 +765,7 @@ class AgentRuntime:
         self.log(f"Wrote {len(content)} bytes to {file_path.name}")
         return {
             "status": "ok",
-            "summary": f"Wrote {file_path.name} ({len(content)} bytes)",
+            "summary": f"Wrote {file_path.name} ({len(content)} bytes) — {self._summarize_code_snippet(content)}",
             "output_file": str(file_path.relative_to(Path.cwd())),
         }
 
@@ -766,6 +788,15 @@ class AgentRuntime:
                     "stdout": "",
                     "stderr": "",
                 }
+
+        # ── Normalize path prefixes ──
+        # Qwen often generates backend/XXX paths (thinking from project root),
+        # but actual cwd is the workspace directory. Strip mistaken prefix.
+        import re
+        normalized = re.sub(r'\b(?:(?:\.\./)?backend/|\.\./src/)', '', cmd, count=1).strip()
+        if normalized != cmd:
+            self.log(f"Normalized path: '{cmd}' → '{normalized}'")
+            cmd = normalized
 
         import subprocess
         try:
@@ -794,10 +825,17 @@ class AgentRuntime:
             stdout = result.stdout or ""
             stderr = result.stderr or ""
             self.log(f"Executed: {effective_cmd} exit={result.returncode}")
-            output = stdout + stderr
+            if result.returncode == 0:
+                summary = f"exit=0"
+                if stdout.strip():
+                    last = [l for l in stdout.strip().splitlines() if l.strip()][-3:]
+                    summary += f", last lines: {' | '.join(last)}"
+            else:
+                err_head = [l for l in stderr.strip().splitlines() if l.strip()][:5]
+                summary = f"exit={result.returncode}, stderr: {' | '.join(err_head)}" if err_head else f"exit={result.returncode}"
             return {
                 "status": "ok" if result.returncode == 0 else "fail",
-                "summary": f"exit={result.returncode}, output={output[:2000]}",
+                "summary": summary,
                 "exit_code": result.returncode,
                 "stdout": stdout[:2000],
                 "stderr": stderr[:2000],

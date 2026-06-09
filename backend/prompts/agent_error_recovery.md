@@ -14,6 +14,9 @@
 {% if has_node %}- {{ node_version }}（{{ npm_version }}，npm install 到 local node_modules/）
 {% endif %}{% if has_uv %}- {{ uv_version }}（已安装）
 {% endif %}
+### 路径警告
+**不要使用 backend/ 前缀**！当前工作目录是工作区，不是项目根目录。
+如果文件在工作区根目录，直接写 `uv run test.py`，**不要**写 `uv run backend/test.py`。
 ### 执行说明
 - Python 用 {{ pip_run_prefix or 'python' }} 执行，自动走隔离虚拟环境
 {% if has_node %}- npm install 在含 package.json 的目录下执行

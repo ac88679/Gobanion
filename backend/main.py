@@ -1,5 +1,7 @@
 """Gobanion 后端入口"""
 
+import asyncio
+
 import uvicorn
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
@@ -21,9 +23,21 @@ settings = get_settings()
 PROJECT_ROOT = Path(__file__).resolve().parent.parent  # D:\work\Gobanion\
 
 
+def _suppress_windows_pipe_error(loop, context):
+    """Suppress harmless ConnectionResetError from asyncio pipe cleanup on Windows."""
+    exc = context.get("exception")
+    if isinstance(exc, ConnectionResetError):
+        msg = context.get("message", "")
+        if "_call_connection_lost" in msg or "_ProactorBasePipeTransport" in msg:
+            return  # Known Windows asyncio bug, skip silently
+    loop.default_exception_handler(context)
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     log.info("Starting Gobanion backend", env=settings.APP_ENV, debug=settings.DEBUG)
+    # Suppress Windows asyncio pipe cleanup noise
+    asyncio.get_event_loop().set_exception_handler(_suppress_windows_pipe_error)
     # Startup: init services
     dag_service = DagService()
     dispatcher = Dispatcher(dag_service)
