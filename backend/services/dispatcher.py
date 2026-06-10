@@ -52,6 +52,7 @@ class Dispatcher:
         self._processes: dict[str, subprocess.Popen] = {}  # node_id → process
         self._start_times: dict[str, float] = {}      # node_id → timestamp
         self._heartbeats: dict[str, float] = {}        # node_id → last heartbeat
+        self._review_start: dict[str, float] = {}      # node_id → when reviewing started
         self._loop: Optional[asyncio.AbstractEventLoop] = None
         self._poll_task: Optional[asyncio.Task] = None
         self._heartbeat_task: Optional[asyncio.Task] = None
@@ -294,6 +295,29 @@ class Dispatcher:
                             # If agent doesn't come back to set interrupted, clean up here
                             # after a short wait — just mark interrupted as final state
                             self.dag_service.transition_node(node_id, "interrupted")
+
+                # Check reviewing timeout: 300s stuck → failed
+                REVIEW_TIMEOUT = 300
+                for dag in self.dag_service.list_dags(limit=50):
+                    if dag.status != "running":
+                        continue
+                    for node in self.dag_service.get_nodes_by_dag(dag.dag_id):
+                        if node.status != "reviewing":
+                            self._review_start.pop(node.node_id, None)
+                            continue
+                        # First time we see this reviewing node — record start
+                        if node.node_id not in self._review_start:
+                            self._review_start[node.node_id] = now
+                            continue
+                        elapsed = now - self._review_start[node.node_id]
+                        if elapsed > REVIEW_TIMEOUT:
+                            log.warning("Review timeout", node_id=node.node_id,
+                                        elapsed=f"{elapsed:.0f}s")
+                            self.dag_service.transition_node(
+                                node.node_id, "failed",
+                                error=f"Review timed out after {int(elapsed)}s"
+                            )
+                            self._review_start.pop(node.node_id, None)
             except Exception as e:
                 log.error("Heartbeat cycle error", error=str(e))
 

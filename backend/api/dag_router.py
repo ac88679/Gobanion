@@ -9,6 +9,9 @@ from fastapi import APIRouter, HTTPException
 
 from pydantic import BaseModel
 from services import DagService
+from services.logger import get_logger
+
+log = get_logger("dag_router")
 
 router = APIRouter(prefix="/api/v1/dag", tags=["dag"])
 
@@ -150,6 +153,17 @@ def transition_node(dag_id: str, node_id: str, body: TransitionRequest):
             "assigned_agents": body.assigned_agents,
         }
         node = svc.transition_node(node_id, body.status, **extra)
+
+        # Auto-review: when node reaches reviewing, evaluate in background thread
+        if node.status == "reviewing" and body.self_check:
+            import threading
+            t = threading.Thread(
+                target=_run_review_async,
+                args=(node_id, dag_id, node.goal, node.acceptance_criteria, body.self_check),
+                daemon=True,
+            )
+            t.start()
+
         return _node_to_dict(node)
     except ValueError as e:
         raise HTTPException(400, str(e))
@@ -276,6 +290,96 @@ def list_events(dag_id: str, limit: int = 50):
         }
         for e in events
     ]
+
+
+# ── Auto-review ──────────────────────────────────────────────────────
+
+
+_REVIEW_MAX_RETRIES = 3
+_REVIEW_RETRY_DELAY = 10
+
+
+def _run_review(goal: str, criteria: str, self_check: list) -> dict:
+    """Call DeepSeek to evaluate a node's self-check report.
+
+    Pure function — takes plain strings, returns parsed dict.
+    Thread-safe: creates its own LLMClient per call.
+    """
+    import json as _json
+
+    prompt = (
+        f"Review this sub-agent's self-check report.\n\n"
+        f"## Goal\n{goal}\n\n"
+        f"## Acceptance criteria\n{criteria}\n\n"
+        f"## Self-check results\n"
+        f"{_json.dumps(self_check, ensure_ascii=False, indent=2)}\n\n"
+        f"Evaluate: did this node actually accomplish its goal?\n"
+        f"- If ALL criteria passed or only minor cosmetic issues, respond with: "
+        f'{{"passed": true, "summary": "..."}}\n'
+        f"- If ANY criterion clearly failed with substantive issues, respond with: "
+        f'{{"passed": false, "summary": "..."}}\n\n'
+        f"Output valid JSON only, no markdown."
+    )
+
+    from services.llm_client import LLMClient
+    llm = LLMClient(public=True)
+    content = llm.chat_text([{"role": "user", "content": prompt}])
+
+    import re
+    try:
+        return _json.loads(content)
+    except _json.JSONDecodeError:
+        match = re.search(r'\{.*\}', content, re.DOTALL)
+        if match:
+            try:
+                return _json.loads(match.group(0))
+            except _json.JSONDecodeError:
+                pass
+        return {"passed": True, "summary": "Review parse failed, defaulting to pass"}
+
+
+def _run_review_async(node_id: str, dag_id: str, goal: str, criteria: str, self_check: list):
+    """Background thread: review self_check with retry, then transition node.
+
+    Spawned in transition handler when node → reviewing.
+    Retries up to _REVIEW_MAX_RETRIES times on transient failures.
+    All retries exhausted → node transitions to failed.
+    """
+    import time
+
+    svc = get_svc()
+
+    for attempt in range(_REVIEW_MAX_RETRIES):
+        try:
+            result = _run_review(goal, criteria, self_check)
+            # Check node hasn't been moved since (manual abort, timeout, etc.)
+            node = svc.get_node(node_id)
+            if not node or node.status != "reviewing":
+                return
+
+            if result.get("passed", False):
+                log.info("Review passed", node_id=node_id)
+                svc.transition_node(node_id, "completed")
+            else:
+                reason = result.get("summary", "Review failed")
+                log.info("Review failed", node_id=node_id, reason=reason)
+                svc.transition_node(node_id, "failed", error=reason[:2000])
+            return  # success
+
+        except Exception as e:
+            log.warning("Review attempt failed", node_id=node_id,
+                        attempt=attempt + 1, max_retries=_REVIEW_MAX_RETRIES, error=str(e))
+            if attempt < _REVIEW_MAX_RETRIES - 1:
+                time.sleep(_REVIEW_RETRY_DELAY)
+
+    # All retries exhausted — mark failed
+    try:
+        node = svc.get_node(node_id)
+        if node and node.status == "reviewing":
+            svc.transition_node(node_id, "failed",
+                                error=f"Review failed after {_REVIEW_MAX_RETRIES} retries")
+    except Exception as e:
+        log.error("Review final failover failed", node_id=node_id, error=str(e))
 
 
 # ── Helpers ────────────────────────────────────────────────────────

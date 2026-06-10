@@ -22,7 +22,6 @@ import json
 import os
 import sys
 import threading
-import time
 import traceback
 from datetime import datetime, timezone
 from pathlib import Path
@@ -31,8 +30,7 @@ from typing import Optional
 from services.llm_client import LLMClient
 
 # ── Loop Agent constants ──
-MAX_RETRIES = 3          # 每步最大重试次数
-MAX_TOTAL_STEPS = 20     # 全局最大执行步数（含修复步骤）
+MAX_TOTAL_STEPS = 20     # 全局最大 ReAct 循环步数
 
 # 从 services 加载 prompt（agent_runner.py 作为 subprocess 运行时路径可能不同）
 # 直接算相对路径，不依赖 import
@@ -135,6 +133,34 @@ class AgentRuntime:
                 if f.is_file() and f.parent == self._outputs_dir:
                     upstream_files.append(f.name)
                     _su.copy2(f, self.workspace / f.name)
+
+        # ── Upstream context: fetch DAG info for upstream nodes' goals/self_check ──
+        upstream_context = "(无)"
+        try:
+            dag_data = self._http_get(f"/api/v1/dag/{self.dag_id}")
+            all_nodes = dag_data.get("nodes", [])
+            own_node = next((n for n in all_nodes if n.get("node_id") == self.node_id), {})
+            dep_ids = own_node.get("dependencies", [])
+            summaries = []
+            for n in all_nodes:
+                if n.get("node_id") in dep_ids and n.get("status") == "completed":
+                    sc_text = ""
+                    sc = n.get("self_check")
+                    if sc:
+                        if isinstance(sc, list):
+                            fails = [c.get("criterion", "") for c in sc if c.get("result") != "pass"]
+                            sc_text = f", 未通过: {fails}" if fails else ", 全部通过"
+                        else:
+                            sc_text = f", self_check: {str(sc)[:100]}"
+                    summaries.append(
+                        f"  [{n['node_id']}] {n.get('goal', '')[:200]}"
+                        f" — outputs: {n.get('outputs', [])}{sc_text}"
+                    )
+            if summaries:
+                upstream_context = "\n".join(summaries)
+        except Exception as e:
+            self.log(f"Upstream context fetch failed (non-fatal): {e}")
+
         self._ctx = {
             "node_id": self.node_id,
             "dag_id": self.dag_id,
@@ -148,6 +174,7 @@ class AgentRuntime:
             "npm_version": self._npm_version if self._has_npm else "",
             "os_type": self._os_type,
             "upstream_files": upstream_files,
+            "upstream_context": upstream_context,
         }
 
         # ── State ──
@@ -217,6 +244,23 @@ class AgentRuntime:
             msg = e.read().decode("utf-8", errors="replace")
             raise RuntimeError(f"HTTP {e.code} from {url}: {msg}")
 
+    def _http_get(self, path: str) -> dict:
+        """Raw HTTP GET via urllib, bypasses proxy."""
+        import json as _json
+        import urllib.request as _req
+        import urllib.error as _err
+
+        url = f"{self.master_api}{path}"
+        handler = _req.ProxyHandler({})
+        opener = _req.build_opener(handler)
+        req = _req.Request(url, method="GET", headers={"User-Agent": "gobanion-agent/0.1"})
+        try:
+            resp = opener.open(req, timeout=30)
+            return _json.loads(resp.read().decode("utf-8"))
+        except _err.HTTPError as e:
+            msg = e.read().decode("utf-8", errors="replace")
+            raise RuntimeError(f"HTTP {e.code} from {url}: {msg}")
+
     def set_status(self, status: str, **extra) -> dict:
         """Update node status via master HTTP API."""
         body = {"status": status, **extra}
@@ -240,6 +284,8 @@ class AgentRuntime:
             "status": result.get("status", "unknown"),
             "summary": result.get("summary", ""),
             "description": description,
+            "stdout": result.get("stdout", "")[:500],
+            "stderr": result.get("stderr", "")[:500],
             "timestamp": datetime.now(timezone.utc).isoformat(),
         }
         memory_file = self.workspace / "_memory.jsonl"
@@ -457,13 +503,18 @@ class AgentRuntime:
                     summary = entry.get("summary", "")
                     description = entry.get("description", "")
 
-                    if action in ("start", "plan", "plan_failed", "self_check", "abort", "interrupted"):
+                    if action in ("start", "plan"):
                         continue
                     if step is None or (isinstance(step, int) and step <= 0):
                         continue
 
                     base = f"  步骤 {step}: [{action}] {description}" if description else f"  步骤 {step}: [{action}]"
-                    lines.append(f"{base}  → {status}  {summary}")
+                    line = f"{base}  → {status}  {summary}"
+                    # Append stderr for failed steps
+                    entry_stderr = entry.get("stderr", "")
+                    if entry_stderr and status != "ok":
+                        line += f"\n    stderr: {entry_stderr[:300]}"
+                    lines.append(line)
         except Exception:
             return "(读取历史失败)"
 
@@ -474,48 +525,50 @@ class AgentRuntime:
     # ── Main workflow ──────────────────────────────────────────────
 
     def run(self):
-        """Execute the assigned node."""
+        """Execute the assigned node using ReAct loop (think→act→observe)."""
         self.log(f"Starting node {self.node_id} as {self.agent_role}")
 
         # 1. Mark running
         self.set_status("running")
         self.write_memory(0, "start", {"status": "ok", "summary": "Agent started"})
 
-        # 2. Plan all steps (one-shot)
-        try:
-            plan = self._plan_steps()
-        except Exception as e:
-            err = f"Planning failed: {e}"
-            self.log(err)
-            self.set_status("failed", outputs=self.outputs, error=err)
-            self.write_memory(-1, "plan_failed", {"status": "fail", "summary": str(e)})
-            return
-
-        self.log(f"Planned {len(plan)} steps")
-        self.write_memory(0, "plan", {"status": "ok", "summary": f"{len(plan)} steps"})
-
-        # 3. Execute steps (Loop Agent: retry + recovery on failure)
-        retry_counts: dict[int, int] = {}
-        step_idx = 0
-        total_steps_executed = 0
-
-        while step_idx < len(plan):
+        # 2. ReAct loop: decide → execute → observe, repeat
+        total_steps = 0
+        while total_steps < MAX_TOTAL_STEPS:
             if self.check_abort():
                 self.log("Received abort signal, stopping")
                 self._handle_abort()
                 return
-            if total_steps_executed >= MAX_TOTAL_STEPS:
-                err = f"Max total steps ({MAX_TOTAL_STEPS}) exceeded"
+
+            total_steps += 1
+            self.step = total_steps
+            self.log(f"ReAct step {self.step}")
+
+            # Decide next action
+            try:
+                decision = self._react_decide_next()
+            except Exception as e:
+                err = f"Decision failed: {e}"
                 self.log(err)
                 self.set_status("failed", outputs=self.outputs, error=err)
+                self.write_memory(self.step, "decision_failed",
+                                  {"status": "fail", "summary": str(e)})
                 return
 
-            step_def = plan[step_idx]
-            self.step = step_idx + 1
-            self.log(f"Step {self.step}: {step_def.get('action', 'unknown')}")
-            total_steps_executed += 1
+            action = decision.get("action", "")
+            if action == "done":
+                self.log("Agent decided task is complete")
+                break
 
-            # Execute step — exception is also converted to fail dict for unified handling
+            # Build step_def from decision
+            step_def = {
+                "action": action,
+                "description": decision.get("description", ""),
+                "output_file": decision.get("output_file", ""),
+                "command": decision.get("command", ""),
+            }
+
+            # Execute step
             try:
                 result = self._execute_step(step_def)
             except Exception as e:
@@ -527,62 +580,23 @@ class AgentRuntime:
                     "stderr": str(e),
                 }
 
-            self.write_memory(self.step, step_def.get("action", "execute"), result,
+            self.write_memory(self.step, action, result,
                               description=step_def.get("description", ""))
 
             if result.get("status") == "ok":
-                # Collect outputs
                 if result.get("output_file"):
                     self.outputs.append(result["output_file"])
-                step_idx += 1
-                continue
+            else:
+                # Failure is information — ReAct will see it in history and decide next action
+                self.log(f"Step {self.step} failed, ReAct will decide next action: {result.get('summary', '')}")
 
-            # ── Fix step failure → abort immediately (no recovery for fixes) ──
-            if step_def.get("_is_fix"):
-                err = f"Fix step {self.step} failed, aborting: {result.get('summary', '')}"
-                self.log(err)
-                self.set_status("failed", outputs=self.outputs, error=err)
-                return
+        if total_steps >= MAX_TOTAL_STEPS:
+            err = f"Max total steps ({MAX_TOTAL_STEPS}) exceeded"
+            self.log(err)
+            self.set_status("failed", outputs=self.outputs, error=err)
+            return
 
-            # ── Step failed — attempt recovery ──
-            retry_counts[step_idx] = retry_counts.get(step_idx, 0) + 1
-            if retry_counts[step_idx] > MAX_RETRIES:
-                err = f"Step {self.step} failed after {MAX_RETRIES} retries: {result.get('summary', '')}"
-                self.log(err)
-                self.set_status("failed", outputs=self.outputs, error=err)
-                return
-
-            # Limit fix-and-retry cycles for the same step
-            fix_attempts = step_def.get("_fix_attempts", 0)
-            if fix_attempts >= MAX_RETRIES:
-                err = f"Step {self.step} failed after {MAX_RETRIES} fix cycles: {result.get('summary', '')}"
-                self.log(err)
-                self.set_status("failed", outputs=self.outputs, error=err)
-                return
-
-            recovery = self._recover_from_error(step_def, result, retry_counts[step_idx])
-            action = recovery.get("action", "abort")
-
-            if action == "retry":
-                self.log(f"Recovery: retrying step {self.step}")
-                # step_idx unchanged → retry same step
-            elif action == "fix_and_retry":
-                    step_def["_fix_attempts"] = fix_attempts + 1
-                    fix_steps = self._build_fix_steps(recovery)
-                    if fix_steps:
-                        self.log(f"Recovery: inserting {len(fix_steps)} fix step(s) before step {self.step}")
-                        plan[step_idx:step_idx] = fix_steps
-                        # step_idx unchanged → first fix step runs next iteration
-            elif action == "skip":
-                self.log(f"Recovery: skipping step {self.step}")
-                step_idx += 1
-            else:  # abort
-                err = f"Step {self.step} unrecoverable: {recovery.get('reason', '')}"
-                self.log(err)
-                self.set_status("failed", outputs=self.outputs, error=err)
-                return
-
-        # 4. Self-check
+        # 3. Self-check
         self.log("Running self-check...")
         try:
             self_check = self._run_self_check()
@@ -591,112 +605,81 @@ class AgentRuntime:
             self.log(f"Self-check failed: {e}")
             self_check = [{"criterion": "run completed", "result": "pass", "evidence": "script finished"}]
 
-        # 5. Publish outputs to shared _outputs/ directory
+        # 4. Publish outputs to shared _outputs/ directory
         self._publish_outputs()
 
-        # 6. Done
+        # 5. Done
         self.set_status("done", outputs=self.outputs, self_check=self_check)
         self.log(f"Node {self.node_id} completed")
 
-    def _plan_steps(self) -> list[dict]:
-        """One-shot planning: goal → list of steps, using tool calling."""
+    def _react_decide_next(self) -> dict:
+        """ReAct: observe current state → decide next action via tool calling."""
         goal = self.task_def.get("goal", "Complete the assigned task")
         criteria = self.task_def.get("acceptance_criteria", "")
-        skills = ", ".join(self.required_skills) if self.required_skills else "general"
 
-        prompt = get_prompt("agent_step_planner.md",
+        prompt = get_prompt("agent_react.md",
                             role=self.agent_role, goal=goal,
-                            criteria=criteria, skills=skills,
+                            criteria=criteria,
+                            history=self._build_step_history(),
                             **self._ctx)
 
-        # ── Tool definition: plan_steps ──
+        # ── Tool definition: act ──
         tools = [{
             "type": "function",
             "function": {
-                "name": "plan_steps",
-                "description": "规划完成目标的步骤，返回步骤列表",
+                "name": "act",
+                "description": "根据当前状态决定下一步行动",
                 "parameters": {
                     "type": "object",
                     "properties": {
-                        "steps": {
-                            "type": "array",
-                            "description": "步骤列表",
-                            "items": {
-                                "type": "object",
-                                "properties": {
-                                    "action": {
-                                        "type": "string",
-                                        "description": "做什么",
-                                        "enum": ["create_dir", "write_file", "execute_code", "analyze", "test", "review"],
-                                    },
-                                    "description": {
-                                        "type": "string",
-                                        "description": "这一步完成什么",
-                                    },
-                                    "output_file": {
-                                        "type": "string",
-                                        "description": "write_file/create_dir 时指定文件名或目录名；execute_code/test 时传空字符串",
-                                    },
-                                    "command": {
-                                        "type": "string",
-                                        "description": "仅在 action=execute_code 或 action=test 时使用，指定要执行的 shell 命令。其他 action 不要填。",
-                                    },
-                                },
-                                "required": ["action", "description", "output_file"],
-                            },
-                        }
+                        "reasoning": {
+                            "type": "string",
+                            "description": "你的思考——分析当前已完成步骤、剩余工作、下一步做什么及原因",
+                        },
+                        "action": {
+                            "type": "string",
+                            "enum": ["write_file", "execute_code", "create_dir", "analyze", "done"],
+                            "description": "下一步行动：write_file=写文件, execute_code=执行命令, create_dir=创建目录, analyze=分析/生成报告, done=任务完成",
+                        },
+                        "description": {
+                            "type": "string",
+                            "description": "这一步要完成什么",
+                        },
+                        "output_file": {
+                            "type": "string",
+                            "description": "write_file/create_dir/analyze 时的输出文件名。execute_code 时填空字符串。",
+                        },
+                        "command": {
+                            "type": "string",
+                            "description": "仅在 action=execute_code 时使用，指定 shell 命令。其他 action 不要填。",
+                        },
                     },
-                    "required": ["steps"],
+                    "required": ["reasoning", "action", "description"],
                 },
             },
         }]
 
-        # vLLM 转发的 Qwen 支持 tool calling，用 tool_choice="required"
-        # 子 Agent 走本地模型，public=False
-        try:
-            result = self.llm_client.chat_with_tools(
-                [{"role": "user", "content": prompt}],
-                tools,
-                tool_choice="required",
-            )
-        except Exception as e:
-            self.log(f"Tool calling failed, falling back to text LLM: {e}")
-            raw = self.llm_client.chat_text([{"role": "user", "content": prompt}])
-            return self._parse_plan_fallback(raw)
+        for attempt in range(2):
+            try:
+                result_list = self.llm_client.chat_with_tools(
+                    [{"role": "user", "content": prompt}],
+                    tools,
+                    tool_choice="required",
+                )
+                decision = result_list[0]["arguments"] if result_list else None
+                if not decision:
+                    raise ValueError("Tool call returned no arguments")
+                action = decision.get("action", "done")
+                if action not in ("write_file", "execute_code", "create_dir", "analyze", "done"):
+                    raise ValueError(f"Invalid action: {action}")
+                self.log(f"ReAct: {action} — {decision.get('reasoning', '')[:120]}")
+                return decision
+            except Exception as e:
+                self.log(f"ReAct decision attempt {attempt + 1} failed: {e}")
+                if attempt == 0:
+                    continue
+                return {"action": "done", "description": f"Fallback after error: {e}"}
 
-        # Extract steps from tool call result
-        for call in result:
-            if call["name"] == "plan_steps":
-                steps = call["arguments"].get("steps", [])
-                if steps:
-                    return steps
-
-        # Fallback
-        self.log("Tool call returned no steps, using fallback")
-        return [{"action": "write_file", "description": goal, "output_file": "output.txt"}]
-
-    def _parse_plan_fallback(self, raw: str) -> list[dict]:
-        """Fallback: try to parse JSON from text response."""
-        import re
-        try:
-            return json.loads(raw)
-        except json.JSONDecodeError:
-            match = re.search(r"\[.*?\]", raw, re.DOTALL)
-            if match:
-                try:
-                    return json.loads(match.group(0))
-                except json.JSONDecodeError:
-                    pass
-            cleaned = re.sub(r"(?<!\\)\\(?![\\\"])", "", raw)
-            cleaned = re.sub(r",\s*([\]}])", r"\1", cleaned)
-            match = re.search(r"\[(.*)\]", cleaned, re.DOTALL)
-            if match:
-                try:
-                    return json.loads("[" + match.group(1) + "]")
-                except json.JSONDecodeError:
-                    pass
-            self.log(f"Fallback parse failed, raw: {raw}")
-            return [{"action": "write_file", "description": goal, "output_file": "output.txt"}]
 
     def _execute_step(self, step_def: dict) -> dict:
         """Execute a single step. Returns result dict."""
@@ -709,6 +692,8 @@ class AgentRuntime:
             return self._step_write_file(step_def)
         elif action in ("execute_code", "test", "run"):
             return self._step_execute(step_def)
+        elif action == "analyze":
+            return self._step_llm_generate(step_def)
         else:
             # Default: use LLM to generate output
             return self._step_llm_generate(step_def)
@@ -753,7 +738,8 @@ class AgentRuntime:
             prompt = get_prompt("agent_write_file.md",
                                 role=self.agent_role, goal=goal,
                                 history=self._build_step_history(),
-                                description=step_def.get("description", ""))
+                                description=step_def.get("description", ""),
+                                **self._ctx)
 
             content = self.llm_chat([{"role": "user", "content": prompt}])
         # Strip markdown code block wrapping (LLMs love wrapping code in ```)
@@ -899,156 +885,9 @@ class AgentRuntime:
 
         return {
             "status": "ok",
-            "summary": f"Generated {file_path.name}",
+            "summary": f"Generated {file_path.name} — {self._summarize_code_snippet(content)}",
             "output_file": str(file_path.relative_to(Path.cwd())),
         }
-
-    def _recover_from_error(self, step_def: dict, result: dict, retry_count: int) -> dict:
-        """Analyze step failure and decide recovery strategy via tool calling.
-
-        Uses tool calling (function calling) instead of text JSON parsing,
-        which is much more reliable — no escaping issues, no JSON repair needed.
-        """
-        prompt = get_prompt("agent_error_recovery.md",
-                            role=self.agent_role,
-                            goal=self.task_def.get("goal", ""),
-                            history=self._build_step_history(),
-                            step_def=json.dumps(step_def, ensure_ascii=False),
-                            exit_code=str(result.get("exit_code", "?")),
-                            stdout=result.get("stdout", ""),
-                            stderr=result.get("stderr", ""),
-                            retry_count=str(retry_count),
-                            **self._ctx)
-
-        # ── Tool definition: recover ──
-        tools = [{
-            "type": "function",
-            "function": {
-                "name": "recover",
-                "description": "分析步骤失败原因并决定恢复策略",
-                "parameters": {
-                    "type": "object",
-                    "properties": {
-                        "action": {
-                            "type": "string",
-                            "enum": ["retry", "fix_and_retry", "skip", "abort"],
-                            "description": "恢复策略：retry=直接重试, fix_and_retry=修复后重试, skip=跳过, abort=放弃",
-                        },
-                        "reason": {
-                            "type": "string",
-                            "description": "分析结论——为什么失败，为什么选择这个策略",
-                        },
-                        "steps": {
-                            "type": "array",
-                            "description": "修复步骤列表（仅 fix_and_retry 时需要）。每个步骤是独立的修复操作。",
-                            "items": {
-                                "type": "object",
-                                "properties": {
-                                    "fix_action": {
-                                        "type": "string",
-                                        "enum": ["execute_code", "write_file"],
-                                        "description": "execute_code=执行命令, write_file=写文件",
-                                    },
-                                    "fix_description": {
-                                        "type": "string",
-                                        "description": "这一步做什么",
-                                    },
-                                    "fix_command": {
-                                        "type": "string",
-                                        "description": "fix_action=execute_code 时必须提供。一条简单的 shell 命令，只做一件事。",
-                                    },
-                                    "fix_output_file": {
-                                        "type": "string",
-                                        "description": "仅 fix_action=write_file 时使用。要写入的文件路径。",
-                                    },
-                                    "fix_content": {
-                                        "type": "string",
-                                        "description": "可选，仅 fix_action=write_file 时使用。文件内容。如果是多行代码可以省略，Runner 自动生成。",
-                                    },
-                                },
-                                "required": ["fix_action"],
-                            },
-                        },
-                    },
-                    "required": ["action", "reason"],
-                },
-            },
-        }]
-
-        for attempt in range(2):
-            try:
-                result_list = self.llm_client.chat_with_tools(
-                    [{"role": "user", "content": prompt}],
-                    tools,
-                    tool_choice="required",
-                )
-                decision = result_list[0]["arguments"] if result_list else None
-                if not decision:
-                    raise ValueError("Tool call returned no arguments")
-                action = decision.get("action", "abort")
-                if action not in ("retry", "fix_and_retry", "skip", "abort"):
-                    raise ValueError(f"Invalid action: {action}")
-                self.log(f"Recovery: {action} — {decision.get('reason', '')}")
-                return decision
-            except Exception as e:
-                self.log(f"Recovery decision attempt {attempt + 1} failed: {e}")
-                if attempt == 0:
-                    self.log("Retrying recovery...")
-                else:
-                    return {"action": "abort", "reason": f"Recovery LLM call failed after retry: {e}"}
-
-    def _build_fix_steps(self, recovery: dict) -> list[dict]:
-        """Convert recovery decision into a list of fix step dicts.
-
-        Supports two formats:
-        1. New (preferred): recovery["steps"] = [{...}, ...]
-           Each step has fix_action, fix_command/fix_output_file, optional fix_content
-        2. Legacy: recovery["fix_action"] + recovery["fix_command"]/["fix_content"]
-        """
-        steps_raw = recovery.get("steps")
-        if isinstance(steps_raw, list):
-            out = []
-            for i, s in enumerate(steps_raw):
-                if s.get("fix_action") == "write_file":
-                    out.append({
-                        "action": "write_file",
-                        "description": s.get("fix_description", f"修复步骤 {i+1}"),
-                        "output_file": s.get("fix_output_file", "fix.py"),
-                        "content": s.get("fix_content", ""),
-                        "_is_fix": True,
-                    })
-                elif s.get("fix_command", "").strip():
-                    out.append({
-                        "action": "execute_code",
-                        "description": s.get("fix_description", f"修复步骤 {i+1}"),
-                        "command": s.get("fix_command", ""),
-                        "output_file": "",
-                        "_is_fix": True,
-                    })
-                else:
-                    self.log(f"Step {i}: execute_code without fix_command, skipping")
-            return out
-
-        # Legacy fallback: single fix_action
-        if recovery.get("fix_action") == "write_file":
-            return [{
-                "action": "write_file",
-                "description": recovery.get("fix_description", "Fix file"),
-                "output_file": recovery.get("fix_output_file", "fix.py"),
-                "content": recovery.get("fix_content", ""),
-                "_is_fix": True,
-            }]
-        elif recovery.get("fix_command", "").strip():
-            return [{
-                "action": "execute_code",
-                "description": recovery.get("fix_description", "Fix environment"),
-                "command": recovery.get("fix_command", ""),
-                "output_file": "",
-                "_is_fix": True,
-            }]
-        else:
-            self.log("execute_code fix step without fix_command, skipping")
-            return []
 
     def _run_self_check(self) -> list[dict]:
         """Check each acceptance criterion."""

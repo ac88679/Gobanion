@@ -80,15 +80,12 @@ def test_transition_node():
         # running
         svc.transition_node(nid, "running")
         assert svc.get_node(nid).status == "running"
-        # done
+        # done → auto-advances to reviewing
         svc.transition_node(nid, "done", outputs=["file.txt"],
                             self_check=[{"criterion": "ok", "result": "pass"}])
         n = svc.get_node(nid)
-        assert n.status == "done"
+        assert n.status == "reviewing"
         assert "file.txt" in n.outputs
-        # reviewing
-        svc.transition_node(nid, "reviewing")
-        assert svc.get_node(nid).status == "reviewing"
         # completed
         svc.transition_node(nid, "completed")
         assert svc.get_node(nid).status == "completed"

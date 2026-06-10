@@ -158,13 +158,13 @@ class DagService:
 
     def _on_transition(self, session: Session, node: DagNode, old: str, new: str) -> None:
         """Side effects on status transition."""
-        # MVP: auto-advance done → completed (no reviewing step yet)
+        # Reviewing: done → reviewing → (master agent reviews) → completed/failed
         if new == "done":
-            node.status = "completed"
+            node.status = "reviewing"
             node.updated_at = datetime.now(timezone.utc)
             session.add(node)
             session.commit()
-            new = "completed"
+            new = "reviewing"
 
         if new == "completed":
             # Check all nodes in this DAG to see if everything is done

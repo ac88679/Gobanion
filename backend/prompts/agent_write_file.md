@@ -5,6 +5,10 @@
 
 当前任务：{{ description }}
 
+{% if upstream_context and upstream_context != "(无)" %}
+上游节点产出:
+{{ upstream_context }}
+{% endif %}
 写出文件内容。只输出文件内容，不要解释。
 
 注意：
