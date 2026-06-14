@@ -647,14 +647,14 @@ class AgentRuntime:
                         },
                         "output_file": {
                             "type": "string",
-                            "description": "write_file/create_dir/analyze 时的输出文件名。execute_code 时填空字符串。",
+                            "description": "必填。write_file=要写入/修改的文件名（如 init_db.py）；analyze=报告文件名（如 step_N.txt）；execute_code=填空字符串",
                         },
                         "command": {
                             "type": "string",
                             "description": "仅在 action=execute_code 时使用，指定 shell 命令。其他 action 不要填。",
                         },
                     },
-                    "required": ["reasoning", "action", "description"],
+                    "required": ["reasoning", "action", "description", "output_file"],
                 },
             },
         }]
